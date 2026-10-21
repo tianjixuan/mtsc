@@ -1,1 +1,541 @@
+name: Multi-Protocol Proxy Scanner (Runner Engine)
 
+on:
+  workflow_dispatch:
+    inputs:
+      shards_preset:
+        description: '分片机器预设选择'
+        required: true
+        type: choice
+        options:
+          - '4 台机器 (默认稳妥，推荐 50 万以下)'
+          - '8 台机器 (极速并发，推荐 50 万以上)'
+          - 'custom (使用下方自定义输入)'
+        default: '4 台机器 (默认稳妥，推荐 50 万以下)'
+      custom_shards:
+        description: '自定义分片机器数 (选 custom 时生效，范围 1~20)'
+        required: false
+        default: '4'
+      protocol:
+        description: '探测协议模式'
+        required: false
+        type: choice
+        options:
+          - 'all (全协议: HTTP/HTTPS/SOCKS4/SOCKS5)'
+          - 'socks (SOCKS5 + SOCKS4)'
+          - 'http (HTTP + HTTPS 网页代理)'
+          - 'socks5 (仅 SOCKS5)'
+          - 'http_only (仅 HTTP 正向代理)'
+          - 'https_only (仅 HTTPS CONNECT 代理)'
+          - 'socks4_only (仅 SOCKS4)'
+        default: 'all (全协议: HTTP/HTTPS/SOCKS4/SOCKS5)'
+      dict_mode:
+        description: '弱密码字典模式'
+        required: false
+        type: choice
+        options:
+          - 'fast (默认精简: 优先免密 + 5 组核心高频弱密，共 6 组)'
+          - 'extended (丰富扩展: 包含 25+ 组常用默认口令)'
+          - 'full (完整 329 组)'
+          - 'none (仅免密探测: 不尝试任何弱口令)'
+        default: 'fast (默认精简: 优先免密 + 5 组核心高频弱密，共 6 组)'
+      fetch_online:
+        description: '是否聚合全网公开代理源 (自动拉取数万个公开代理并入待测队列)'
+        required: false
+        type: boolean
+        default: false
+      port_preset:
+        description: '端口预设选择'
+        required: false
+        type: choice
+        options:
+          - 'auto (按探测协议智能匹配常规端口)'
+          - '1080 (SOCKS 默认标准单端口)'
+          - '1080,1081,1082,10808,10809 (SOCKS 常见高频端口)'
+          - '8080 (HTTP 默认代理单端口)'
+          - '3128 (Squid 默认代理单端口)'
+          - '80,8080,3128,8888,8000,8081 (HTTP/HTTPS 常规 6 端口)'
+          - '1080,8080 (SOCKS + HTTP 核心双端口)'
+          - '1080,8080,3128,7890,8888,10808 (全协议综合高频 TOP 6)'
+          - '80,443,1080,3128,7890,8000,8080,8081,8888,10808 (全协议综合 TOP 10)'
+          - '8000-9000 (代理服务常用段 8000~9000)'
+          - '1-10000 (常用前 10000 端口)'
+          - '1-65535 (全端口 1~65535)'
+          - 'custom (使用下方自定义端口，支持逗号或范围)'
+        default: 'auto (按探测协议智能匹配常规端口)'
+      custom_ports:
+        description: '自定义端口 (支持单个端口、逗号分隔、或范围如 1-65535、8000-8080)'
+        required: false
+        default: '1080'
+      workers:
+        description: '每台机器并发 Goroutine 数 (推荐 1000~2000)'
+        required: false
+        default: '1000'
+      timeout:
+        description: '超时时间 (推荐 2s~3s 极速过滤)'
+        required: false
+        default: '3s'
+      limit:
+        description: '单台机器最大扫描数量 (0 为扫描全部)'
+        required: false
+        default: '0'
+      shuffle:
+        description: '随机打散目标 (防防火墙与蜜罐连续告警)'
+        required: false
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  generate-matrix:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.calc-matrix.outputs.matrix }}
+      total_shards: ${{ steps.calc-matrix.outputs.total_shards }}
+
+    steps:
+      - name: Calculate Shard Matrix
+        id: calc-matrix
+        run: |
+          python3 - <<'EOF'
+          import json
+          import os
+
+          preset = "${{ github.event.inputs.shards_preset || '4' }}"
+          custom = "${{ github.event.inputs.custom_shards || '4' }}"
+
+          if "8" in preset:
+              shards = 8
+          elif "custom" in preset:
+              try:
+                  shards = int(custom)
+              except ValueError:
+                  shards = 4
+          else:
+              shards = 4
+
+          shards = max(1, min(20, shards))
+
+          shard_list = list(range(shards))
+          print(f"[*] 选定分片数量: {shards} 台机器")
+          print(f"[*] 分片矩阵: {shard_list}")
+
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+              f.write(f"matrix={json.dumps(shard_list)}\n")
+              f.write(f"total_shards={shards}\n")
+          EOF
+
+  expand:
+    needs: generate-matrix
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        continue-on-error: true
+
+      - name: Fetch Private Repository Asset (if configured)
+        env:
+          MY_PAT: ${{ secrets.MY_PAT }}
+          PRIVATE_REPO: ${{ secrets.PRIVATE_REPO }}
+        run: |
+          if [ -n "$MY_PAT" ] && [ -n "$PRIVATE_REPO" ]; then
+            echo "[*] 检测到跨仓密钥配置，正在从私有仓库 ${PRIVATE_REPO} 获取 ip.txt..."
+            git clone --depth 1 "https://${MY_PAT}@github.com/${PRIVATE_REPO}.git" private_vault
+            if [ -f private_vault/ip.txt ]; then
+              cp private_vault/ip.txt ./ip.txt
+              echo "[+] 成功拉取私有仓库 ip.txt"
+            fi
+            rm -rf private_vault
+          else
+            echo "[*] 本地仓库模式，使用本地 ip.txt"
+          fi
+
+      - name: Expand IP ranges
+        env:
+          PORT_PRESET: ${{ github.event.inputs.port_preset || 'auto (按探测协议智能匹配常规端口)' }}
+          CUSTOM_PORTS: ${{ github.event.inputs.custom_ports || '1080' }}
+          PROTOCOL: ${{ github.event.inputs.protocol || 'all' }}
+          FETCH_ONLINE: ${{ github.event.inputs.fetch_online || 'false' }}
+        run: |
+          python3 - <<'EOF'
+          import ipaddress
+          import os
+          import sys
+
+          input_file = "ip.txt"
+          output_file = "ip_list.txt"
+
+          preset = os.getenv("PORT_PRESET", "auto")
+          custom = os.getenv("CUSTOM_PORTS", "1080")
+          proto = os.getenv("PROTOCOL", "all").lower()
+
+          if "custom" in preset:
+              raw_ports = custom
+          elif preset.startswith("auto"):
+              if "socks" in proto and "http" not in proto:
+                  raw_ports = "1080,1081,1082,10808,10809"
+              elif "http" in proto and "socks" not in proto:
+                  raw_ports = "80,443,8080,8443,3128,7890,8000,8081,8888,8889"
+              else:
+                  raw_ports = "80,443,1080,3128,7890,8000,8080,8081,8443,8888,10808"
+          else:
+              raw_ports = preset.split()[0]
+
+          ports = []
+          for token in raw_ports.replace("，", ",").split(","):
+              token = token.strip()
+              if not token:
+                  continue
+              if "-" in token:
+                  parts = token.split("-")
+                  if len(parts) == 2:
+                      try:
+                          s, e = int(parts[0]), int(parts[1])
+                          if 1 <= s <= e <= 65535:
+                              ports.extend([str(p) for p in range(s, e + 1)])
+                      except ValueError:
+                          pass
+              else:
+                  try:
+                      p = int(token)
+                      if 1 <= p <= 65535:
+                          ports.append(str(p))
+                  except ValueError:
+                      pass
+
+          if not ports:
+              ports = ["1080"]
+
+          if len(ports) > 10:
+              print(f"[*] 正在为目标绑定端口: 共 {len(ports)} 个端口 (从 {ports[0]} 到 {ports[-1]})")
+          else:
+              print(f"[*] 正在为目标绑定端口: {ports}")
+
+          total_written = 0
+          seen = set()
+
+          with open(output_file, "w", encoding="utf-8") as fout:
+              if os.path.exists(input_file):
+                  with open(input_file, "r", encoding="utf-8") as fin:
+                      for line_num, raw in enumerate(fin, 1):
+                          line = raw.strip()
+                          if not line or line.startswith("#"):
+                              continue
+
+                          clean_target = line
+                          if "://" in clean_target:
+                              clean_target = clean_target.split("://", 1)[1]
+                          if "#" in clean_target:
+                              clean_target = clean_target.split("#", 1)[0].strip()
+
+                          host_part = clean_target.split("@")[-1] if "@" in clean_target else clean_target
+                          if ":" in host_part:
+                              parts = host_part.split(":")
+                              if len(parts) == 2 and parts[1].isdigit():
+                                  if line not in seen:
+                                      seen.add(line)
+                                      fout.write(line + "\n")
+                                      total_written += 1
+                                  print(f"✅ Line {line_num}: {line} (Direct target with port)")
+                                  continue
+
+                          if "-" in line:
+                              parts = [p.strip() for p in line.split("-") if p.strip()]
+                              if len(parts) == 2:
+                                  try:
+                                      start_ip = ipaddress.IPv4Address(parts[0])
+                                      if "." not in parts[1]:
+                                          prefix = ".".join(parts[0].split(".")[:3])
+                                          end_ip = ipaddress.IPv4Address(f"{prefix}.{parts[1]}")
+                                      else:
+                                          end_ip = ipaddress.IPv4Address(parts[1])
+
+                                      if int(start_ip) > int(end_ip):
+                                          start_ip, end_ip = end_ip, start_ip
+
+                                      range_count = int(end_ip) - int(start_ip) + 1
+                                      if range_count > 5000000:
+                                          print(f"⚠️ Line {line_num}: {line} → {range_count} IPs, skipping (too large, max 5,000,000)")
+                                          continue
+
+                                      for int_ip in range(int(start_ip), int(end_ip) + 1):
+                                          ip_str = str(ipaddress.IPv4Address(int_ip))
+                                          for port in ports:
+                                              target = f"{ip_str}:{port}"
+                                              if target not in seen:
+                                                  seen.add(target)
+                                                  fout.write(target + "\n")
+                                                  total_written += 1
+
+                                      print(f"✅ Line {line_num}: {line} (Range) → {range_count} IPs")
+                                      continue
+                                  except ValueError as e:
+                                      print(f"❌ Line {line_num}: '{line}' is invalid range — {e}", file=sys.stderr)
+                                      continue
+
+                          try:
+                              network = ipaddress.ip_network(line, strict=False)
+                              count = network.num_addresses
+
+                              if count > 5000000:
+                                  print(f"⚠️ Line {line_num}: {line} → {count} addresses, skipping (too large, max 5,000,000)")
+                                  continue
+
+                              if count == 1:
+                                  hosts = [network.network_address]
+                              else:
+                                  hosts = network.hosts()
+
+                              for ip in hosts:
+                                  ip_str = str(ip)
+                                  for port in ports:
+                                      target = f"{ip_str}:{port}"
+                                      if target not in seen:
+                                          seen.add(target)
+                                          fout.write(target + "\n")
+                                          total_written += 1
+
+                              print(f"✅ Line {line_num}: {line} (CIDR) → {count if count == 1 else count - 2} hosts")
+
+                          except ValueError as e:
+                              print(f"❌ Line {line_num}: '{line}' is invalid — {e}", file=sys.stderr)
+
+              fetch_online = os.getenv("FETCH_ONLINE", "false").lower() == "true"
+              if fetch_online:
+                  import urllib.request
+                  online_sources = [
+                      "https://raw.githubusercontent.com/TheSpeedX/SOCKS-List/master/socks5.txt",
+                      "https://raw.githubusercontent.com/TheSpeedX/SOCKS-List/master/http.txt",
+                      "https://raw.githubusercontent.com/TheSpeedX/SOCKS-List/master/socks4.txt",
+                      "https://raw.githubusercontent.com/hookzof/socks5_list/master/proxy.txt",
+                      "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/all.txt",
+                      "https://cdn.jsdelivr.net/gh/proxifly/free-proxy-list@main/proxies/all/data.txt",
+                  ]
+                  print("\n[*] 正在从全网高质量公开代理源拉取代理...")
+                  online_added = 0
+                  for src in online_sources:
+                      try:
+                          req = urllib.request.Request(src, headers={"User-Agent": "Mozilla/5.0"})
+                          with urllib.request.urlopen(req, timeout=10) as resp:
+                              content = resp.read().decode("utf-8", errors="ignore")
+                              for raw_line in content.splitlines():
+                                  l = raw_line.strip()
+                                  if not l or l.startswith("#"):
+                                      continue
+                                  clean = l
+                                  if "://" in clean:
+                                      clean = clean.split("://", 1)[1]
+                                  if "#" in clean:
+                                      clean = clean.split("#", 1)[0].strip()
+                                  host_part = clean.split("@")[-1] if "@" in clean else clean
+                                  if ":" in host_part:
+                                      parts = host_part.split(":")
+                                      if len(parts) == 2 and parts[1].isdigit():
+                                          if l not in seen:
+                                              seen.add(l)
+                                              fout.write(l + "\n")
+                                              total_written += 1
+                                              online_added += 1
+                          print(f"✅ 拉取成功: {src}")
+                      except Exception as e:
+                          print(f"⚠️ 拉取失败 ({src}): {e}")
+                  print(f"[*] 公开源拉取完成，共新增 {online_added} 个待测公开代理！")
+
+          print(f"\n📄 Total targets written to {output_file}: {total_written}")
+          EOF
+
+      - name: Upload expanded target list
+        uses: actions/upload-artifact@v4
+        with:
+          name: target-ip-list
+          path: ip_list.txt
+          retention-days: 1
+
+  scan-matrix:
+    needs: [generate-matrix, expand]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ${{ fromJson(needs.generate-matrix.outputs.matrix) }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        continue-on-error: true
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+          cache: true
+
+      - name: Fetch Private Repository Scanner (if configured)
+        env:
+          MY_PAT: ${{ secrets.MY_PAT }}
+          PRIVATE_REPO: ${{ secrets.PRIVATE_REPO }}
+        run: |
+          if [ -n "$MY_PAT" ] && [ -n "$PRIVATE_REPO" ]; then
+            echo "[*] 正在从私有仓库 ${PRIVATE_REPO} 获取 multi_scan.go..."
+            git clone --depth 1 "https://${MY_PAT}@github.com/${PRIVATE_REPO}.git" private_vault
+            if [ -f private_vault/multi_scan.go ]; then
+              cp private_vault/multi_scan.go ./multi_scan.go
+              echo "[+] 成功拉取 multi_scan.go"
+            fi
+            rm -rf private_vault
+          else
+            echo "[*] 本地仓库模式，使用本地 multi_scan.go"
+          fi
+
+      - name: Download target list
+        uses: actions/download-artifact@v4
+        with:
+          name: target-ip-list
+
+      - name: Run Multi-Protocol Shard Scanner
+        run: |
+          RAW_PROTO="${{ github.event.inputs.protocol || 'all' }}"
+          PROTO=$(echo "$RAW_PROTO" | awk '{print $1}')
+          RAW_DICT="${{ github.event.inputs.dict_mode || 'fast' }}"
+          DICT=$(echo "$RAW_DICT" | awk '{print $1}')
+          SHUFFLE_ARG=""
+          if [ "${{ github.event.inputs.shuffle }}" = "false" ]; then
+            SHUFFLE_ARG="-shuffle=false"
+          else
+            SHUFFLE_ARG="-shuffle=true"
+          fi
+
+          go run multi_scan.go \
+            -input ip_list.txt \
+            -output "results_${{ matrix.shard }}.txt" \
+            -shard-index ${{ matrix.shard }} \
+            -shard-total ${{ needs.generate-matrix.outputs.total_shards }} \
+            -proto "$PROTO" \
+            -dict "$DICT" \
+            $SHUFFLE_ARG \
+            -workers ${{ github.event.inputs.workers || '1000' }} \
+            -timeout ${{ github.event.inputs.timeout || '3s' }} \
+            -limit ${{ github.event.inputs.limit || '0' }}
+
+      - name: Upload shard result
+        uses: actions/upload-artifact@v4
+        with:
+          name: "shard-${{ matrix.shard }}"
+          path: "results_${{ matrix.shard }}.txt"
+          retention-days: 1
+
+  merge-and-push:
+    needs: [generate-matrix, scan-matrix]
+    if: always() && needs.generate-matrix.result == 'success'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        continue-on-error: true
+
+      - name: Download all shard artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: shards
+
+      - name: Merge, deduplicate and split by protocol
+        id: merge
+        env:
+          RAW_PROTO: ${{ github.event.inputs.protocol || 'all' }}
+        run: |
+          echo "[*] 开始汇总所有分片结果..."
+          mkdir -p temp_merge
+          find shards -type f -name "results_*.txt" -exec cat {} + > temp_merge/raw_all.txt
+
+          TOTAL_LINES=$(grep -v '^\s*$' temp_merge/raw_all.txt 2>/dev/null | wc -l || echo 0)
+          echo "[*] 本次扫描各分片收集到的存活记录数: $TOTAL_LINES"
+
+          grep '^http://' temp_merge/raw_all.txt 2>/dev/null | sort -u > temp_merge/new_http.txt || true
+          grep '^https://' temp_merge/raw_all.txt 2>/dev/null | sort -u > temp_merge/new_https.txt || true
+          grep '^socks5://' temp_merge/raw_all.txt 2>/dev/null | sort -u > temp_merge/new_socks5.txt || true
+          grep '^socks4://' temp_merge/raw_all.txt 2>/dev/null | sort -u > temp_merge/new_socks4.txt || true
+
+          if [ "$TOTAL_LINES" -gt 0 ]; then
+            cp temp_merge/raw_all.txt all_results.txt
+            cp temp_merge/new_http.txt http_results.txt
+            cp temp_merge/new_https.txt https_results.txt
+            cp temp_merge/new_socks5.txt socks5_results.txt
+            cp temp_merge/new_socks4.txt socks4_results.txt
+            echo "has_alive=true" >> $GITHUB_OUTPUT
+            echo "count=$TOTAL_LINES" >> $GITHUB_OUTPUT
+          else
+            echo "has_alive=false" >> $GITHUB_OUTPUT
+            echo "count=0" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Get current date
+        id: date
+        run: |
+          echo "date=$(date -u +'%Y-%m-%d %H:%M:%S UTC')" >> $GITHUB_OUTPUT
+
+      - name: Push results back (Private Repo or Local)
+        if: steps.merge.outputs.has_alive == 'true'
+        env:
+          MY_PAT: ${{ secrets.MY_PAT }}
+          PRIVATE_REPO: ${{ secrets.PRIVATE_REPO }}
+        run: |
+          if [ -n "$MY_PAT" ] && [ -n "$PRIVATE_REPO" ]; then
+            echo "[*] 跨仓模式：正在将存活结果推回私有仓库 ${PRIVATE_REPO}..."
+            git clone "https://${MY_PAT}@github.com/${PRIVATE_REPO}.git" target_repo
+
+            for f in all_results.txt http_results.txt https_results.txt socks5_results.txt socks4_results.txt; do
+              if [ -s "$f" ]; then
+                if [ -f "target_repo/$f" ]; then
+                  cat "$f" "target_repo/$f" | grep -v '^\s*$' | sort -u > "target_repo/${f}.tmp"
+                  mv "target_repo/${f}.tmp" "target_repo/$f"
+                else
+                  cp "$f" target_repo/
+                fi
+              fi
+            done
+
+            cd target_repo
+            git config --local user.email "github-actions[bot]@users.noreply.github.com"
+            git config --local user.name "github-actions[bot]"
+            git add *_results.txt
+            if ! git diff --staged --quiet; then
+              git commit -m "Auto-update multi-protocol proxy results (${{ steps.date.outputs.date }}) [skip ci]"
+              git pull --rebase origin test2 2>/dev/null || git pull --rebase origin beta 2>/dev/null || git pull --rebase origin main 2>/dev/null || true
+              git push origin HEAD
+              echo "[+] 成功将结果提交并推回到私有仓库！"
+            else
+              echo "[*] 代理列表无变更，跳过提交。"
+            fi
+            cd ..
+          else
+            echo "[*] 本地仓库模式：直接提交并推送到当前仓库..."
+            git config --local user.email "github-actions[bot]@users.noreply.github.com"
+            git config --local user.name "github-actions[bot]"
+            git add *_results.txt
+            if ! git diff --staged --quiet; then
+              CURRENT_BRANCH="${GITHUB_REF#refs/heads/}"
+              git commit -m "Auto-update multi-protocol proxy results (${{ steps.date.outputs.date }}) [skip ci]"
+              git pull --rebase origin "$CURRENT_BRANCH" 2>/dev/null || true
+              git push origin "$CURRENT_BRANCH" 2>/dev/null || true
+            else
+              echo "[*] 代理列表无变更，跳过提交。"
+            fi
+          fi
+
+      - name: Clean old workflow runs (Keep latest 1 run)
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.MY_PAT || secrets.GITHUB_TOKEN }}
+        run: |
+          echo "[*] 清理旧的 workflow 运行记录，仅保留最新 1 条..."
+          CURRENT_RUN_ID="${{ github.run_id }}"
+          TARGET_REPO="${GITHUB_REPOSITORY}"
+          gh run list --repo "$TARGET_REPO" --limit 100 --json databaseId --jq '.[] | select(.databaseId != ('"$CURRENT_RUN_ID"')) | .databaseId' 2>/dev/null | while read -r id; do
+            [ -n "$id" ] && gh run delete --repo "$TARGET_REPO" "$id" || true
+          done
+          echo "[+] 清理完成！"
