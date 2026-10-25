@@ -505,7 +505,7 @@ jobs:
             git add *_results.txt
             if ! git diff --staged --quiet; then
               git commit -m "Auto-update multi-protocol proxy results (${{ steps.date.outputs.date }}) [skip ci]"
-              git pull --rebase origin test2 2>/dev/null || git pull --rebase origin beta 2>/dev/null || git pull --rebase origin main 2>/dev/null || true
+              git pull --rebase origin beta 2>/dev/null || git pull --rebase origin main 2>/dev/null || true
               git push origin HEAD
               echo "[+] 成功将结果提交并推回到私有仓库！"
             else
@@ -527,15 +527,27 @@ jobs:
             fi
           fi
 
-      - name: Clean old workflow runs (Keep latest 1 run)
+      - name: Destroy temporary artifacts and purge old runs
         if: always()
         env:
           GH_TOKEN: ${{ secrets.MY_PAT || secrets.GITHUB_TOKEN }}
         run: |
-          echo "[*] 清理旧的 workflow 运行记录，仅保留最新 1 条..."
+          echo "[*] 安全防泄露清理：正在彻底销毁本次运行产生的所有中转 Artifacts..."
           CURRENT_RUN_ID="${{ github.run_id }}"
           TARGET_REPO="${GITHUB_REPOSITORY}"
+
+          # 1. 物理删除当前 Run 产生的所有中转工件（彻底消除公开仓库 Actions 页面泄露风险）
+          gh api "/repos/${TARGET_REPO}/actions/runs/${CURRENT_RUN_ID}/artifacts" --jq '.artifacts[].id' 2>/dev/null | while read -r art_id; do
+            if [ -n "$art_id" ]; then
+              echo "[-] 正在销毁工件 ID: $art_id"
+              gh api -X DELETE "/repos/${TARGET_REPO}/actions/artifacts/$art_id" 2>/dev/null || true
+            fi
+          done
+          echo "[+] 所有中转 Artifacts 已彻底物理销毁，外部访客无法查看或下载任何扫描结果！"
+
+          # 2. 清理旧的 workflow 运行记录，仅保留最新 1 条
+          echo "[*] 清理旧的 workflow 运行记录，仅保留最新 1 条..."
           gh run list --repo "$TARGET_REPO" --limit 100 --json databaseId --jq '.[] | select(.databaseId != ('"$CURRENT_RUN_ID"')) | .databaseId' 2>/dev/null | while read -r id; do
-            [ -n "$id" ] && gh run delete --repo "$TARGET_REPO" "$id" || true
+            [ -n "$id" ] && gh run delete --repo "$TARGET_REPO" "$id" 2>/dev/null || true
           done
           echo "[+] 清理完成！"
