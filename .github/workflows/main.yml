@@ -11,11 +11,11 @@ on:
           - '4 台机器 (默认稳妥，推荐 50 万以下)'
           - '8 台机器 (极速并发，推荐 50 万以上)'
           - 'custom (使用下方自定义输入)'
-        default: '4 台机器 (默认稳妥，推荐 50 万以下)'
+        default: 'custom (使用下方自定义输入)'
       custom_shards:
         description: '自定义分片机器数 (选 custom 时生效，范围 1~20)'
         required: false
-        default: '4'
+        default: '20'
       protocol:
         description: '探测协议模式'
         required: false
@@ -28,7 +28,7 @@ on:
           - 'http_only (仅 HTTP 正向代理)'
           - 'https_only (仅 HTTPS CONNECT 代理)'
           - 'socks4_only (仅 SOCKS4)'
-        default: 'all (全协议: HTTP/HTTPS/SOCKS4/SOCKS5)'
+        default: 'socks5 (仅 SOCKS5)'
       dict_mode:
         description: '弱密码字典模式'
         required: false
@@ -38,7 +38,7 @@ on:
           - 'extended (丰富扩展: 包含 25+ 组常用默认口令)'
           - 'full (完整 329 组)'
           - 'none (仅免密探测: 不尝试任何弱口令)'
-        default: 'fast (默认精简: 优先免密 + 5 组核心高频弱密，共 6 组)'
+        default: 'full (完整 329 组)'
       fetch_online:
         description: '是否聚合全网公开代理源 (自动拉取数万个公开代理并入待测队列)'
         required: false
@@ -70,7 +70,7 @@ on:
       workers:
         description: '每台机器并发 Goroutine 数 (推荐 1000~2000)'
         required: false
-        default: '1000'
+        default: '3000'
       timeout:
         description: '超时时间 (推荐 2s~3s 极速过滤)'
         required: false
